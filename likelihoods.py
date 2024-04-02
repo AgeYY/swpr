@@ -1,17 +1,18 @@
 import abc
 import numpy as np
 import tensorflow as tf
+import tensorflow_probability as tfp
 
-from gpflow.params import Parameter
-from gpflow import likelihoods, settings, transforms
-from gpflow.decors import params_as_tensors
+from gpflow import Parameter
+from gpflow import likelihoods
+from tensorflow_probability import bijectors as tfp_bijectors
 
 
 class DynamicCovarianceBaseLikelihood(likelihoods.Likelihood):
     """
     Abstract class for all Wishart process likelihoods.
     """
-    def __init__(self, D, cov_dim, nu, n_mc_samples, model_inverse, heavy_tail, dof=2.5):
+    def __init__(self, input_dim, D, cov_dim, nu, n_mc_samples, model_inverse, heavy_tail, dof=2.5):
         """
         IMPORTANT: No concrete class should directly inherit this Base class. Instead, construct concrete likelihoods
         using the component abstract likelihood classes.
@@ -26,7 +27,7 @@ class DynamicCovarianceBaseLikelihood(likelihoods.Likelihood):
         :param dof: float; optional initial value for degrees of freedom parameter for a multivariate-t emission
             distribution. This is ignored if heavy_tail==False.
         """
-        super().__init__()
+        super().__init__(input_dim=input_dim, latent_dim=cov_dim * nu, observation_dim=D)
         self.n_mc_samples = n_mc_samples
 
         self.D = D
@@ -38,7 +39,7 @@ class DynamicCovarianceBaseLikelihood(likelihoods.Likelihood):
         if heavy_tail:
             # create degrees of freedom; must be > 2!
             # self.dof = 2.5
-            self.dof = Parameter(dof, transform=transforms.positive, dtype=settings.float_type)
+            self.dof = Parameter(dof, transform=tfp_bijectors.Softplus(), dtype=tf.float64)
 
     @abc.abstractmethod
     def make_gaussian_components(self, F, Y):
@@ -54,8 +55,7 @@ class DynamicCovarianceBaseLikelihood(likelihoods.Likelihood):
         """
         raise NotImplementedError("Method not implemented.")
 
-    @params_as_tensors
-    def logp_(self, F, Y):
+    def _log_prob(self, F, Y):
         """
         Compute the (Monte Carlo estimate of) the log likelihood given samples of the GPs.
 
@@ -65,20 +65,20 @@ class DynamicCovarianceBaseLikelihood(likelihoods.Likelihood):
         """
         log_det_cov, yt_inv_y = self.make_gaussian_components(F, Y)  # (S, N), (S, N)
 
-        D_ = tf.cast(self.D, settings.float_type)
+        D_ = tf.cast(self.D, tf.float64)
 
         if not self.heavy_tail:
             logp = - 0.5 * D_ * np.log(2 * np.pi) - 0.5 * yt_inv_y  # (S, N)
         else:
-            dof = tf.cast(self.dof, settings.float_type)
+            dof = tf.cast(self.dof, tf.float64)
             logp = tf.lgamma(0.5 * (dof + D_)) - tf.lgamma(0.5 * dof) - 0.5 * D_ * tf.log(np.pi * dof) \
                    - 0.5 * (dof + D_) * tf.log(1.0 + yt_inv_y / dof)  # (S, N)
 
         logp = logp - 0.5 * log_det_cov
         return tf.reduce_mean(logp, axis=0)  # (N,)
 
-    @params_as_tensors
-    def variational_expectations(self, f_mean, f_cov, Y):
+
+    def _variational_expectations(self, X, f_mean, f_cov, Y):
         """
         logp. Models inheriting SVGP are required to have this signature.
         Compute log p(Y | variational parameters).
@@ -93,21 +93,27 @@ class DynamicCovarianceBaseLikelihood(likelihoods.Likelihood):
         n_latent = tf.shape(f_mean)[1]
 
         # produce a sample of F, the latent GP points at the input locations X
-        f_sample = tf.random_normal((self.n_mc_samples, N, n_latent), dtype=settings.float_type) * (f_cov ** 0.5) \
+        f_sample = tf.random.normal((self.n_mc_samples, N, n_latent), dtype=tf.float64) * (f_cov ** 0.5) \
                    + f_mean  # (S, N, D * nu)
         f_sample = tf.reshape(f_sample, (self.n_mc_samples, N, self.cov_dim, -1))  # (S, N, cov_dim, nu)
 
         # finally, the likelihood variant will use these to compute the appropriate log density
-        logp = self.logp_(f_sample, Y)
+        logp = self._log_prob(f_sample, Y)
 
         return logp
+
+    def _predict_log_density(self, Fmu, Fvar, Y):
+        pass
+
+    def _predict_mean_and_var(self, Fmu, Fvar):
+        pass
 
 
 class FullCovLikelihood(DynamicCovarianceBaseLikelihood):
     """
     Concrete class for full covariance models.
     """
-    def __init__(self, D, n_mc_samples, heavy_tail, model_inverse, approx_wishart,
+    def __init__(self,input_dim, D, n_mc_samples, heavy_tail, model_inverse, approx_wishart,
                  nu=None, dof=2.5):
         """
 
@@ -124,24 +130,23 @@ class FullCovLikelihood(DynamicCovarianceBaseLikelihood):
         if nu < D:
             raise Exception("Wishart DOF must be >= D.")
 
-        super().__init__(D, cov_dim=D, nu=nu, n_mc_samples=n_mc_samples, model_inverse=model_inverse,
+        super().__init__(input_dim, D, cov_dim=D, nu=nu, n_mc_samples=n_mc_samples, model_inverse=model_inverse,
                          heavy_tail=heavy_tail, dof=dof)
 
         self.model_inverse = model_inverse
         self.approx_wishart = approx_wishart
 
         # this case assumes a square scale matrix, and it must lead with dimension D
-        self.scale_diag = Parameter(np.ones(self.D), transform=transforms.positive, dtype=settings.float_type)
+        self.scale_diag = Parameter(np.ones(self.D), transform=tfp_bijectors.Softplus(), dtype=tf.float64)
 
         if approx_wishart:
             # create additional noise param; should be positive; conc=0.1 and rate=0.0001 initializes sigma2inv=1000 and
             # thus initializes sigma2=0.001
-            self.p_sigma2inv_conc = Parameter(0.1, transform=transforms.positive, dtype=settings.float_type)
-            self.p_sigma2inv_rate = Parameter(0.0001, transform=transforms.positive, dtype=settings.float_type)
-            self.q_sigma2inv_conc = Parameter(0.1 * np.ones(self.D), transform=transforms.positive, dtype=settings.float_type)
-            self.q_sigma2inv_rate = Parameter(0.0001 * np.ones(self.D), transform=transforms.positive, dtype=settings.float_type)
+            self.p_sigma2inv_conc = Parameter(0.1, transform=tfp_bijectors.Softplus(), dtype=tf.float64)
+            self.p_sigma2inv_rate = Parameter(0.0001, transform=tfp_bijectors.Softplus(), dtype=tf.float64)
+            self.q_sigma2inv_conc = Parameter(0.1 * np.ones(self.D), transform=tfp_bijectors.Softplus(), dtype=tf.float64)
+            self.q_sigma2inv_rate = Parameter(0.0001 * np.ones(self.D), transform=tfp_bijectors.Softplus(), dtype=tf.float64)
 
-    @params_as_tensors
     def make_gaussian_components(self, F, Y):
         """
         An auxiliary function for logp that returns the components of a Gaussian kernel.
@@ -156,7 +161,7 @@ class FullCovLikelihood(DynamicCovarianceBaseLikelihood):
 
         if self.approx_wishart:
             n_samples = tf.shape(F)[0]  # could be 1 if making predictions
-            dist = tf.distributions.Gamma(self.q_sigma2inv_conc, self.q_sigma2inv_rate)
+            dist = tfp.distributions.Gamma(self.q_sigma2inv_conc, self.q_sigma2inv_rate)
             sigma2_inv = dist.sample([n_samples])  # (S, D)
             sigma2_inv = tf.clip_by_value(sigma2_inv, 1e-8, np.inf)
             sigma2 = sigma2_inv ** -1.0
@@ -168,14 +173,12 @@ class FullCovLikelihood(DynamicCovarianceBaseLikelihood):
         else:
             additive_part = 1e-5  # at the very least add some small fixed noise
 
-        affa = tf.matrix_set_diag(affa, tf.matrix_diag_part(affa) + additive_part)
+        affa = tf.linalg.set_diag(affa, tf.linalg.diag_part(affa) + additive_part)
 
-        L = tf.cholesky(affa)  # (S, N, D, D)
-        log_det_cov = 2 * tf.reduce_sum(tf.log(tf.matrix_diag_part(L)), axis=2)  # (S, N)
+        L = tf.linalg.cholesky(affa)  # (S, N, D, D)
+        log_det_cov = 2 * tf.reduce_sum(tf.math.log(tf.linalg.diag_part(L)), axis=2)  # (S, N)
         if self.model_inverse:
             log_det_cov = - log_det_cov
-
-        Y.set_shape([None, self.D])  # in GPflow 1.0 I didn't need to do this
 
         if self.model_inverse:
             # avoid the Cholesky decomposition altogether, more computation, but probably more accurate
@@ -196,7 +199,7 @@ class FactoredCovLikelihood(DynamicCovarianceBaseLikelihood):
     """
     Concrete class for factored covariance models.
     """
-    def __init__(self, D, n_mc_samples, n_factors, heavy_tail, model_inverse, nu=None, dof=2.5):
+    def __init__(self,input_dim, D, n_mc_samples, n_factors, heavy_tail, model_inverse, nu=None, dof=2.5):
         """
 
         :param D: The dimensionality of the covariance matrix being constructed with the multi-output GPs.
@@ -217,7 +220,7 @@ class FactoredCovLikelihood(DynamicCovarianceBaseLikelihood):
         if nu < n_factors:
             raise Exception("Wishart DOF must be >= n_factors.")
 
-        super().__init__(D, cov_dim=n_factors, nu=nu, n_mc_samples=n_mc_samples, model_inverse=model_inverse,
+        super().__init__(input_dim, D, cov_dim=n_factors, nu=nu, n_mc_samples=n_mc_samples, model_inverse=model_inverse,
                          heavy_tail=heavy_tail, dof=dof)
 
         self.n_factors = n_factors
@@ -225,15 +228,14 @@ class FactoredCovLikelihood(DynamicCovarianceBaseLikelihood):
 
         # no such thing as a non-full scale matrix in this case
         A = np.ones([self.D, self.n_factors])
-        self.scale = Parameter(A, transform=transforms.positive, dtype=settings.float_type)
+        self.scale = Parameter(A, transform=tfp_bijectors.Softplus(), dtype=tf.float64)
 
         # all factored models are approximate models
-        self.p_sigma2inv_conc = Parameter(0.1, transform=transforms.positive, dtype=settings.float_type)
-        self.p_sigma2inv_rate = Parameter(0.0001, transform=transforms.positive, dtype=settings.float_type)
-        self.q_sigma2inv_conc = Parameter(0.1 * np.ones(self.D), transform=transforms.positive, dtype=settings.float_type)
-        self.q_sigma2inv_rate = Parameter(0.0001 * np.ones(self.D), transform=transforms.positive, dtype=settings.float_type)
+        self.p_sigma2inv_conc = Parameter(0.1, transform=tfp_bijectors.Softplus(), dtype=tf.float64)
+        self.p_sigma2inv_rate = Parameter(0.0001, transform=tfp_bijectors.Softplus(), dtype=tf.float64)
+        self.q_sigma2inv_conc = Parameter(0.1 * np.ones(self.D), transform=tfp_bijectors.Softplus(), dtype=tf.float64)
+        self.q_sigma2inv_rate = Parameter(0.0001 * np.ones(self.D), transform=tfp_bijectors.Softplus(), dtype=tf.float64)
 
-    @params_as_tensors
     def make_gaussian_components(self, F, Y):
         """
         In the case of the factored covariance matrices, we should never directly represent the covariance or precision
