@@ -56,7 +56,7 @@ factored = False  # whether or not to use a factored model
 n_factors = 3  # number of factors in a factored model (ignored if factored==False)
 heavy_tail = False  # whether to use the heavy-tailed emission distribution
 model_inverse = True  # if True, then use an inverse Wishart process; if False, use a Wishart process
-approx_wishart = True  # if True, use the additive white noise model
+approx_wishart = False  # if True, use the additive white noise model. Problem when setting True, these parameters (e.g. p_sigma2inv_conc) is not connected to loss
 
 
 # initilize the variational inducing points
@@ -254,12 +254,12 @@ Yp_train = Y_train - Y_mean[None, :]
 # optimiser = tf.optimizers.Adam(learning_rate=0.01)
 optimiser = gpflow.optimizers.Scipy()
 # for _ in range(n_iterations):
-print(model.trainable_variables)
 optimiser.minimize(model.training_loss_closure((X_train, Yp_train)), model.trainable_variables)
 
 # Prediction (assuming the model's predict method is compatible with TensorFlow 2 and GPflow 2)
 preds = model.predict(X_test)
 
+print(preds['mu'])
 # Processing the predictions as needed
 
 # Convert numpy arrays to lists for JSON serialization

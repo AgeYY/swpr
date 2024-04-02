@@ -40,12 +40,12 @@ class DynamicCovarianceRegression(SVGP):
     def construct_predictive_density(self):
         # No more placeholders; use tf.Variable or function arguments instead
         D = self.likelihood.D
-        # self.X_new = tf.Variable([[0]], dtype=tf.float64, shape=[None, 1])  # Example, shape will be dynamic
-        # self.Y_new = tf.Variable([[0] * D], dtype=tf.float64, shape=[None, D])  # Example, shape will be dynamic
-        # self.n_samples = tf.Variable(0, dtype=tf.float64, shape=[])  # Example, initial value will be replaced
-        self.X_new = tf.zeros([0, 1], dtype=tf.float64)  # Use an empty tensor as a placeholder with the dynamic shape
-        self.Y_new = tf.zeros([0, D], dtype=tf.float64)  # Use an empty tensor as a placeholder with the dynamic shape
-        self.n_samples = tf.constant(10, dtype=tf.float64)  # Use a scalar tensor
+        self.X_new = tf.Variable([[0]], dtype=tf.float64, shape=[None, 1])  # Example, shape will be dynamic
+        self.Y_new = tf.Variable([[0] * D], dtype=tf.float64, shape=[None, D])  # Example, shape will be dynamic
+        self.n_samples = tf.Variable(0, dtype=tf.float64, shape=[])  # Example, initial value will be replaced
+        # self.X_new = tf.zeros([0, 1], dtype=tf.float64)  # Use an empty tensor as a placeholder with the dynamic shape
+        # self.Y_new = tf.zeros([0, D], dtype=tf.float64)  # Use an empty tensor as a placeholder with the dynamic shape
+        # self.n_samples = tf.constant(10, dtype=tf.float64)  # Use a scalar tensor
 
         # demean
         
@@ -118,15 +118,13 @@ class FullCovarianceRegression(DynamicCovarianceRegression):
         return affa
 
     def predict(self, X_new):
-
-        sess = self.enquire_session()
-        mu, s2 = sess.run([self.F_mean_new, self.F_var_new], feed_dict={self.X_new: X_new})  # (N_new, D, nu), (N_new, D, nu)
-        scale_diag = self.likelihood.scale_diag.read_value(sess)  # (D,)
+        mu, s2 = self.F_mean_new, self.F_var_new
+        scale_diag = self.likelihood.scale_diag.numpy()  # (D,)
         params = dict(mu=mu, s2=s2, scale_diag=scale_diag)
 
         if self.likelihood.approx_wishart:
-            sigma2inv_conc = self.likelihood.q_sigma2inv_conc.read_value(sess)  # (D,)
-            sigma2inv_rate = self.likelihood.q_sigma2inv_rate.read_value(sess)
+            sigma2inv_conc = self.likelihood.q_sigma2inv_conc.numpy()  # (D,)
+            sigma2inv_rate = self.likelihood.q_sigma2inv_rate.numpy()
             params.update(dict(sigma2inv_conc=sigma2inv_conc, sigma2inv_rate=sigma2inv_rate))
 
         return params
