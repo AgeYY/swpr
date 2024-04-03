@@ -1,14 +1,16 @@
 import numpy as np
 from scipy.special import logsumexp
 import tensorflow as tf
+import tensorflow_probability as tfp
+import gpflow
 
-from gpflow import settings
-from gpflow.decors import params_as_tensors
-from gpflow.models.svgp import SVGP
-import gpflow.training.monitor as gpmon
+# from gpflow import settings
+# from gpflow.decors import params_as_tensors
+# from gpflow.models.svgp import SVGP
+# import gpflow.training.monitor as gpmon
 
 
-class DynamicCovarianceRegression(SVGP):
+class DynamicCovarianceRegression(gpflow.models.SVGP):
     """
     Effectively a helper wrapping call to SVGP.
     """
@@ -27,41 +29,42 @@ class DynamicCovarianceRegression(SVGP):
         nu = likelihood.nu
 
         # X and Y are the training dataset, demean and save for prediction time
-        Y_mean = np.mean(Y, axis=0)  # (D,)
-        Y = Y - Y_mean  # (N, D)
+        # Y_mean = np.mean(Y, axis=0)  # (D,)
+        # Y = Y - Y_mean  # (N, D)
 
-        super().__init__(X, Y, kern, likelihood,
-                         feat=None,
+        inducing_variable = gpflow.inducing_variables.InducingPoints(Z)
+
+        super().__init__(kern, likelihood, inducing_variable,
                          mean_function=None,
-                         num_latent=cov_dim * nu,
+                         num_latent_gps=cov_dim * nu,
                          q_diag=False,
                          whiten=whiten,
-                         minibatch_size=minibatch_size,
-                         Z=Z,
-                         name='SVGP')  # must provide a name space when delaying build for GPflow opt functionality
+                         )  # must provide a name space when delaying build for GPflow opt functionality
 
-        self.compile()  # if I don't compile now then there's a weird error when trying to construct the prediction
-        self.Y_mean = Y_mean  # used when constructing the predictions
-        self.construct_predictive_density()
+        # self.compile()  # if I don't compile now then there's a weird error when trying to construct the prediction
+        # self.Y_mean = Y_mean  # used when constructing the predictions
+        # self.construct_predictive_density()
 
-    @params_as_tensors
-    def construct_predictive_density(self):
+    def construct_predictive_density(self, X_new, Y_new, n_samples=100):
         D = self.likelihood.D
-        self.X_new = tf.placeholder(dtype=settings.float_type, shape=[None, 1])
-        self.Y_new = tf.placeholder(dtype=settings.float_type, shape=[None, D])
-        self.n_samples = tf.placeholder(dtype=settings.int_type, shape=[])
+        # self.X_new = tf.placeholder(dtype=settings.float_type, shape=[None, 1])
+        # self.Y_new = tf.placeholder(dtype=settings.float_type, shape=[None, D])
+        # self.n_samples = tf.placeholder(dtype=settings.int_type, shape=[])
+        # self.X_new = tf.Variable(tf.zeros([1, 1]), dtype=gpflow.default_float(), trainable=False)
+        # self.Y_new = tf.Variable(tf.zeros([1, D]), dtype=gpflow.default_float(), trainable=False)
+        # self.n_samples = tf.Variable(0, dtype=gpflow.default_int(), trainable=False)
 
         # demean
-        Y_new = self.Y_new - self.Y_mean
+        # Y_new = Y_new - self.Y_mean
 
-        F_mean, F_var = self._build_predict(self.X_new)  # (N_new, num_latent); e.g., num_latent = D * nu
+        F_mean, F_var = self.predict_f(X_new)  # (N_new, num_latent); e.g., num_latent = D * nu
         N_new = tf.shape(F_mean)[0]
         cov_dim = self.likelihood.cov_dim
         self.F_mean_new = tf.reshape(F_mean, [N_new, cov_dim, -1])  # (N_new, cov_dim, nu)
         self.F_var_new = tf.reshape(F_var, [N_new, cov_dim, -1])
 
         nu = tf.shape(self.F_mean_new)[-1]
-        F_samps = tf.random.normal([self.n_samples, N_new, cov_dim, nu], dtype=settings.float_type) \
+        F_samps = tf.random.normal([n_samples, N_new, cov_dim, nu], dtype=settings.float_type) \
                   * (self.F_var_new ** 0.5) + self.F_mean_new
         log_det_cov, yt_inv_y = self.likelihood.make_gaussian_components(F_samps, Y_new)
 
@@ -78,21 +81,27 @@ class DynamicCovarianceRegression(SVGP):
             self.logp_data = - 0.5 * (dof + D_) * tf.log(1.0 + yt_inv_y / dof)
             self.logp = tf.lgamma(0.5 * (dof + D_)) - tf.lgamma(0.5 * dof) - 0.5 * D_ * tf.log(np.pi * dof) \
                         - 0.5 * log_det_cov + self.logp_data  # (S, N)
+        return self.logp, self.logp_data, self.logp_gauss, self.logp_gauss_data
+
 
     def mcmc_predict_density(self, X_new, Y_new, n_samples=100):
-        sess = self.enquire_session()
-        outputs = sess.run([self.logp, self.logp_data, self.logp_gauss, self.logp_gauss_data],
-                           feed_dict={self.X_new: X_new, self.Y_new: Y_new, self.n_samples: n_samples})
+        # sess = self.enquire_session()
+        # outputs = sess.run([self.logp, self.logp_data, self.logp_gauss, self.logp_gauss_data],
+                           # feed_dict={self.X_new: X_new, self.Y_new: Y_new, self.n_samples: n_samples})
+        # feed_dict = {self.X_new: X_new, self.Y_new: Y_new, self.n_samples: n_samples}
+        # func_list = [self.logp, self.logp_data, self.logp_gauss, self.logp_gauss_data]
+        # outputs = [func(**feed_dict) for func in func_list]
+        outputs = self.construct_predictive_density(X_new, Y_new, n_samples)
         log_S = np.log(n_samples)
         return tuple(map(lambda x: logsumexp(x, axis=0) - log_S, outputs))
 
 class FullCovarianceRegression(DynamicCovarianceRegression):
-    @params_as_tensors
     def build_prior_KL(self):
         KL = super().build_prior_KL()
+
         if self.likelihood.approx_wishart:
-            p_dist = tf.distributions.Gamma(self.likelihood.p_sigma2inv_conc, rate=self.likelihood.p_sigma2inv_rate)
-            q_dist = tf.distributions.Gamma(self.likelihood.q_sigma2inv_rate, rate=self.likelihood.q_sigma2inv_rate)
+            p_dist = tfp.distributions.Gamma(self.likelihood.p_sigma2inv_conc, rate=self.likelihood.p_sigma2inv_rate)
+            q_dist = tfp.distributions.Gamma(self.likelihood.q_sigma2inv_rate, rate=self.likelihood.q_sigma2inv_rate)
             self.KL_gamma = tf.reduce_sum(q_dist.kl_divergence(p_dist))
             KL += self.KL_gamma
         return KL
@@ -122,10 +131,17 @@ class FullCovarianceRegression(DynamicCovarianceRegression):
 
     def predict(self, X_new):
 
-        sess = self.enquire_session()
-        mu, s2 = sess.run([self.F_mean_new, self.F_var_new], feed_dict={self.X_new: X_new})  # (N_new, D, nu), (N_new, D, nu)
-        scale_diag = self.likelihood.scale_diag.read_value(sess)  # (D,)
-        params = dict(mu=mu, s2=s2, scale_diag=scale_diag)
+        # sess = self.enquire_session()
+        # mu, s2 = sess.run([self.F_mean_new, self.F_var_new], feed_dict={self.X_new: X_new})  # (N_new, D, nu), (N_new, D, nu)
+
+        F_mean, F_var = self.predict_f(X_new)  # (N_new, num_latent); e.g., num_latent = D * nu
+        N_new = tf.shape(F_mean)[0]
+        cov_dim = self.likelihood.cov_dim
+        self.F_mean_new = tf.reshape(F_mean, [N_new, cov_dim, -1])  # (N_new, cov_dim, nu)
+        self.F_var_new = tf.reshape(F_var, [N_new, cov_dim, -1])
+
+        scale_diag = self.likelihood.scale_diag  # (D,)
+        params = dict(mu=self.F_mean_new, s2=self.F_var_new, scale_diag=scale_diag)
 
         if self.likelihood.approx_wishart:
             sigma2inv_conc = self.likelihood.q_sigma2inv_conc.read_value(sess)  # (D,)
@@ -134,43 +150,43 @@ class FullCovarianceRegression(DynamicCovarianceRegression):
 
         return params
 
-class FactoredCovarianceRegression(DynamicCovarianceRegression):
-    @params_as_tensors
-    def build_prior_KL(self):
-        KL = super().build_prior_KL()
-        p_dist = tf.distributions.Gamma(self.likelihood.p_sigma2inv_conc, rate=self.likelihood.p_sigma2inv_rate)
-        q_dist = tf.distributions.Gamma(self.likelihood.q_sigma2inv_rate, rate=self.likelihood.q_sigma2inv_rate)
-        self.KL_gamma = tf.reduce_sum(q_dist.kl_divergence(p_dist))
-        KL += self.KL_gamma
-        return KL
+# class FactoredCovarianceRegression(DynamicCovarianceRegression):
+#     @params_as_tensors
+#     def build_prior_KL(self):
+#         KL = super().build_prior_KL()
+#         p_dist = tf.distributions.Gamma(self.likelihood.p_sigma2inv_conc, rate=self.likelihood.p_sigma2inv_rate)
+#         q_dist = tf.distributions.Gamma(self.likelihood.q_sigma2inv_rate, rate=self.likelihood.q_sigma2inv_rate)
+#         self.KL_gamma = tf.reduce_sum(q_dist.kl_divergence(p_dist))
+#         KL += self.KL_gamma
+#         return KL
 
-    def predict(self, X_new):
-        """
-        Compute the components needed for prediction: s2_diag, scale, F. It's more efficient to report this since scale
-        is (D, K) and F is (T_test, K, K).
+#     def predict(self, X_new):
+#         """
+#         Compute the components needed for prediction: s2_diag, scale, F. It's more efficient to report this since scale
+#         is (D, K) and F is (T_test, K, K).
 
-        In the Wishart process case, we construct the covariance matrix as:
-            S = np.diag(s2_diag) + U * U^T
-        where
-            U = np.einsum('jk,ikl->ijl', scale, F)
+#         In the Wishart process case, we construct the covariance matrix as:
+#             S = np.diag(s2_diag) + U * U^T
+#         where
+#             U = np.einsum('jk,ikl->ijl', scale, F)
 
-        In the inverse Wishart process case, we construct the precision matrix as:
-            S = np.diag(s2_diag ** -1.0) + U * U^T
-        where
-            U = np.einsum('jk,ikl->ijl', scale, F)
+#         In the inverse Wishart process case, we construct the precision matrix as:
+#             S = np.diag(s2_diag ** -1.0) + U * U^T
+#         where
+#             U = np.einsum('jk,ikl->ijl', scale, F)
 
-        :param X_new:
-        :return:
-        """
+#         :param X_new:
+#         :return:
+#         """
 
-        sess = self.enquire_session()
-        mu, s2 = sess.run([self.F_mean_new, self.F_var_new], feed_dict={self.X_new: X_new})  # (N_new, D, nu), (N_new, D, nu)
-        scale = self.likelihood.scale.read_value(sess)  # (D, Kv)
+#         sess = self.enquire_session()
+#         mu, s2 = sess.run([self.F_mean_new, self.F_var_new], feed_dict={self.X_new: X_new})  # (N_new, D, nu), (N_new, D, nu)
+#         scale = self.likelihood.scale.read_value(sess)  # (D, Kv)
 
-        sigma2inv_conc = self.likelihood.q_sigma2inv_conc.read_value(sess)  # (D,)
-        sigma2inv_rate = self.likelihood.q_sigma2inv_rate.read_value(sess)
-        params = dict(mu=mu, s2=s2, scale=scale, sigma2inv_conc=sigma2inv_conc, sigma2inv_rate=sigma2inv_rate)
-        return params
+#         sigma2inv_conc = self.likelihood.q_sigma2inv_conc.read_value(sess)  # (D,)
+#         sigma2inv_rate = self.likelihood.q_sigma2inv_rate.read_value(sess)
+#         params = dict(mu=mu, s2=s2, scale=scale, sigma2inv_conc=sigma2inv_conc, sigma2inv_rate=sigma2inv_rate)
+#         return params
 
 
 ###########################################
@@ -201,22 +217,22 @@ def get_loglikel(model, Xt, Yt, minibatch_size=100):
 #################################################################
 
 
-class LoglikelTensorBoardTask(gpmon.BaseTensorBoardTask):
-    def __init__(self, file_writer, model, Xt, Yt, summary_name):
-        super().__init__(file_writer, model)
-        self.Xt = Xt
-        self.Yt = Yt
-        self._full_ll = tf.placeholder(settings.float_type, shape=())
-        self._full_ll_data = tf.placeholder(settings.float_type, shape=())
-        self._full_gauss_ll = tf.placeholder(settings.float_type, shape=())
-        self._full_gauss_ll_data = tf.placeholder(settings.float_type, shape=())
-        self._summary = tf.summary.merge([tf.summary.scalar(summary_name + '_full', self._full_ll),
-                                          tf.summary.scalar(summary_name + '_data', self._full_ll_data),
-                                          tf.summary.scalar(summary_name + '_gauss_full', self._full_gauss_ll),
-                                          tf.summary.scalar(summary_name + '_gauss_data', self._full_gauss_ll_data),
-                                          ])
+# class LoglikelTensorBoardTask(gpmon.BaseTensorBoardTask):
+#     def __init__(self, file_writer, model, Xt, Yt, summary_name):
+#         super().__init__(file_writer, model)
+#         self.Xt = Xt
+#         self.Yt = Yt
+#         self._full_ll = tf.placeholder(settings.float_type, shape=())
+#         self._full_ll_data = tf.placeholder(settings.float_type, shape=())
+#         self._full_gauss_ll = tf.placeholder(settings.float_type, shape=())
+#         self._full_gauss_ll_data = tf.placeholder(settings.float_type, shape=())
+#         self._summary = tf.summary.merge([tf.summary.scalar(summary_name + '_full', self._full_ll),
+#                                           tf.summary.scalar(summary_name + '_data', self._full_ll_data),
+#                                           tf.summary.scalar(summary_name + '_gauss_full', self._full_gauss_ll),
+#                                           tf.summary.scalar(summary_name + '_gauss_data', self._full_gauss_ll_data),
+    #                                       ])
 
-    def run(self, context: gpmon.MonitorContext, *args, **kwargs) -> None:
-        loglikel_, loglikel_data_, gauss_ll_, gauss_ll_data_ = get_loglikel(self.model, self.Xt, self.Yt)
-        self._eval_summary(context, {self._full_ll: loglikel_, self._full_ll_data: loglikel_data_,
-                                     self._full_gauss_ll: gauss_ll_, self._full_gauss_ll_data: gauss_ll_data_})
+    # def run(self, context: gpmon.MonitorContext, *args, **kwargs) -> None:
+    #     loglikel_, loglikel_data_, gauss_ll_, gauss_ll_data_ = get_loglikel(self.model, self.Xt, self.Yt)
+    #     self._eval_summary(context, {self._full_ll: loglikel_, self._full_ll_data: loglikel_data_,
+    #                                  self._full_gauss_ll: gauss_ll_, self._full_gauss_ll_data: gauss_ll_data_})
